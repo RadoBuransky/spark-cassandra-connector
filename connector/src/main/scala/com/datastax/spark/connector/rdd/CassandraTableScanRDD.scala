@@ -7,14 +7,14 @@ import com.datastax.spark.connector.cql._
 import com.datastax.spark.connector.datasource.ScanHelper
 import com.datastax.spark.connector.datasource.ScanHelper.CqlQueryParts
 import com.datastax.spark.connector.rdd.CassandraLimit._
-import com.datastax.spark.connector.rdd.partitioner.dht.{Token => ConnectorToken}
 import com.datastax.spark.connector.rdd.partitioner.{CassandraPartition, _}
+import com.datastax.spark.connector.rdd.partitioner.dht.{Token => ConnectorToken}
 import com.datastax.spark.connector.rdd.reader._
-import com.datastax.spark.connector.util.{CountingIterator}
+import com.datastax.spark.connector.util.{CountingIterator, ResilientIterator, ResilientIteratorContext, ResilientIteratorException}
 import com.datastax.spark.connector.writer.RowWriterFactory
+import org.apache.spark.{Partition, Partitioner, SparkContext, TaskContext}
 import org.apache.spark.metrics.InputMetricsUpdater
 import org.apache.spark.rdd.{PartitionCoalescer, RDD}
-import org.apache.spark.{Partition, Partitioner, SparkContext, TaskContext}
 
 import scala.collection.JavaConversions._
 import scala.language.existentials
@@ -58,16 +58,17 @@ import scala.reflect.ClassTag
   * spark.cassandra.input.consistency.level property.
   */
 class CassandraTableScanRDD[R] private[connector](
-    @transient val sc: SparkContext,
-    val connector: CassandraConnector,
-    val keyspaceName: String,
-    val tableName: String,
-    val columnNames: ColumnSelector = AllColumns,
-    val where: CqlWhereClause = CqlWhereClause.empty,
-    val limit: Option[CassandraLimit] = None,
-    val clusteringOrder: Option[ClusteringOrder] = None,
-    val readConf: ReadConf = ReadConf(),
-    overridePartitioner: Option[Partitioner] = None)(
+                                                   @transient val sc: SparkContext,
+                                                   val connector: CassandraConnector,
+                                                   val keyspaceName: String,
+                                                   val tableName: String,
+                                                   val columnNames: ColumnSelector = AllColumns,
+                                                   val where: CqlWhereClause = CqlWhereClause.empty,
+                                                   val limit: Option[CassandraLimit] = None,
+                                                   val clusteringOrder: Option[ClusteringOrder] = None,
+                                                   val readConf: ReadConf = ReadConf(),
+                                                   val handler: Option[PartialFunction[ResilientIteratorException, Option[R]]] = None,
+                                                   overridePartitioner: Option[Partitioner] = None)(
   implicit
     val classTag: ClassTag[R],
     @transient val rowReaderFactory: RowReaderFactory[R])
@@ -296,7 +297,13 @@ class CassandraTableScanRDD[R] private[connector](
       try {
         val scanResult = ScanHelper.fetchTokenRange(scanner, tableDef, queryParts, range, consistencyLevel, fetchSize)
         val iteratorWithMetrics = scanResult.rows.map(metricsUpdater.updateMetrics)
-        val result = iteratorWithMetrics.map(rowReader.read(_, scanResult.metadata))
+        val unhandledIterator = iteratorWithMetrics.map(rowReader.read(_, scanResult.metadata))
+        val result = handler match {
+          case Some(handlerFunction) =>
+            val context = ResilientIteratorContext(queryParts, range)
+            ResilientIterator(unhandledIterator, handlerFunction, context)
+          case None => unhandledIterator
+        }
         result
       } catch {
         case t: Throwable =>
